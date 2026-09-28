@@ -1,0 +1,26 @@
+[project]
+name = "aegismind-connector-gmail"
+version = "0.1.0"
+description = "AegisMind Gmail read-only knowledge connector"
+requires-python = ">=3.12"
+dependencies = [
+    "aegismind-connector-sdk",
+    "aegismind-types",
+    "httpx>=0.27",
+    "pydantic>=2.10",
+]
+
+[project.entry-points."aegismind.connectors"]
+gmail = "aegismind_connector_gmail:GmailConnector"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aegismind_connector_gmail"]
+
+[tool.uv.sources]
+aegismind-types = { workspace = true }
+aegismind-connector-sdk = { workspace = true }
+

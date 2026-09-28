@@ -243,6 +243,7 @@ class RetrievalPipeline:
                 snippet=snippet,
                 score=round(item.score, 4),
                 tenant_id=chunk_tenant,
+                metadata=chunk.metadata,
             )
 
             results.append(

@@ -158,6 +158,8 @@ def discover_connectors() -> dict[str, Any]:
 
     standard_connectors = [
         ("local_filesystem", "aegismind_connector_local_filesystem", "LocalFilesystemConnector"),
+        ("github", "aegismind_connector_github", "GitHubConnector"),
+        ("gmail", "aegismind_connector_gmail", "GmailConnector"),
     ]
 
     for name, module_name, class_name in standard_connectors:
@@ -169,6 +171,9 @@ def discover_connectors() -> dict[str, Any]:
                 cls = getattr(mod, class_name, None)
                 if cls is not None:
                     connectors[name] = cls()
+                    logger.info("Discovered connector: %s (%s)", name, module_name)
+            except ImportError:
+                logger.debug("Connector module '%s' not installed; skipping", module_name)
             except Exception as exc:
                 logger.debug("Failed loading fallback connector '%s': %s", name, exc)
 
@@ -206,6 +211,13 @@ async def init_default_core_state() -> CoreState:
     indexed = await seed_initial_knowledge(vector_store, embedder)
     state.indexed_resources = indexed
     state.connectors = discover_connectors()
+
+    # Register all discovered connectors in the ConnectorRegistry
+    for connector_name, connector_instance in state.connectors.items():
+        try:
+            state.connector_registry.register(connector_name, connector_instance)
+        except Exception as exc:
+            logger.warning("Failed to register connector '%s' in registry: %s", connector_name, exc)
 
     # Seed knowledge graph
     try:

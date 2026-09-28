@@ -1,4 +1,8 @@
-import * as React from "react";
+import sys
+
+filepath = r'd:\aegisMind\apps\lens\src\components\Connectors.tsx'
+
+content = """import * as React from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -22,9 +26,11 @@ import {
   type SystemMode
 } from "@/lib/api";
 import {
+  Share2,
   RefreshCw,
   Settings,
   CheckCircle2,
+  ExternalLink,
   Shield,
   KeyRound,
   Search,
@@ -100,7 +106,7 @@ export function Connectors() {
     setIsSyncing((prev) => ({ ...prev, [connector.name]: true }));
     setActionNotice(null);
     try {
-      await triggerSync(connector.name);
+      const result = await triggerSync(connector.name);
       setActionNotice(`Sync started for ${connector.title}`);
       setTimeout(() => setActionNotice(null), 3000);
       
@@ -387,3 +393,9 @@ export function Connectors() {
     </div>
   );
 }
+"""
+
+with open(filepath, "w") as f:
+    f.write(content)
+
+print("Connectors.tsx updated successfully.")

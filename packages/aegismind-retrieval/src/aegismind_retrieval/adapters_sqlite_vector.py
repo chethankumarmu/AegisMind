@@ -194,7 +194,22 @@ class SqliteVectorStoreAdapter(VectorStorePort):
         for k, v in pre_filter.items():
             if k in {"tenant_id", "tenant", "allowed_groups", "groups"}:
                 continue
-            if chunk.metadata.get(k) != v:
+            if k in {"source_type", "source_types", "source"}:
+                chunk_src = (
+                    chunk.metadata.get("source_type")
+                    or chunk.metadata.get("source")
+                    or chunk.metadata.get("connector")
+                )
+                if isinstance(v, (list, set, tuple)):
+                    if chunk_src not in v:
+                        return False
+                elif chunk_src != v:
+                    return False
+                continue
+            if isinstance(v, (list, set, tuple)):
+                if chunk.metadata.get(k) not in v:
+                    return False
+            elif chunk.metadata.get(k) != v:
                 return False
 
         return True

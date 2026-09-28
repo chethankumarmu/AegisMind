@@ -6,23 +6,26 @@ import { Card, CardContent } from "@/components/ui/card";
 import { streamChat, listModels, parseFile, type Citation, type ModelInfo } from "@/lib/api";
 import { recordExchange } from "@/lib/conversationStore";
 import {
-  Send,
-  Square,
-  Shield,
   Bot,
   User,
-  ExternalLink,
+  Shield,
   FileText,
-  Lock,
-  Cpu,
-  Plus,
   Paperclip,
   X,
+  ExternalLink,
+  Cpu,
+  Lock,
   CornerDownRight,
   Mic,
   MicOff,
   Volume2,
   VolumeX,
+  Database,
+  Github,
+  Mail,
+  Plus,
+  Square,
+  Send,
 } from "lucide-react";
 import SpeechRecognition, { useSpeechRecognition } from 'react-speech-recognition';
 
@@ -97,13 +100,12 @@ export function Chat({
   // When recallMode is true the user is asking the agent to retrieve answers
   // from past conversation memory across all chatboxes
   const [recallMode, setRecallMode] = React.useState(false);
-  const [isListening, setIsListening] = React.useState(false);
+  const [sourceFilter, setSourceFilter] = React.useState({ local: true, github: true, gmail: true });
   const [autoSpeak, setAutoSpeak] = React.useState(true);
   const [isSpeaking, setIsSpeaking] = React.useState(false);
   const [speakingMsgId, setSpeakingMsgId] = React.useState<string | null>(null);
   const [speechErrorMsg, setSpeechErrorMsg] = React.useState<string | null>(null);
-  
-  // Microphone via react-speech-recognition
+
   const {
     transcript,
     listening,
@@ -111,7 +113,7 @@ export function Chat({
     browserSupportsSpeechRecognition,
     isMicrophoneAvailable
   } = useSpeechRecognition();
-  
+
   const baselineTextRef = React.useRef("");
   const abortStreamRef = React.useRef<(() => void) | null>(null);
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
@@ -288,7 +290,7 @@ export function Chat({
   const handleSend = async () => {
     if ((!inputQuery.trim() && attachedFiles.length === 0) || isStreaming) return;
 
-    if (isListening) {
+    if (listening) {
       stopMicrophone();
     }
 
@@ -362,11 +364,18 @@ export function Chat({
     // Captured response for store recording
     let accumulatedResponse = "";
 
+
+    const activeSources = Object.entries(sourceFilter)
+      .filter(([_, active]) => active)
+      .map(([key]) => key);
+
     const cancel = streamChat({
       query: fullQuery,
       tenant_id: currentTenantId,
       user_id: currentUserId,
       model: selectedModel || undefined,
+      sources: activeSources,
+
       onThinking: (status) => {
         setCurrentThinking(status);
       },
@@ -459,7 +468,6 @@ export function Chat({
             </span>
           </div>
           <div className="flex items-center gap-2 text-xs">
-            {/* Auto-Voice Response Toggle */}
             <button
               type="button"
               onClick={() => {
@@ -486,6 +494,39 @@ export function Chat({
               <span>{autoSpeak ? "Voice Output ON" : "Voice Output OFF"}</span>
             </button>
 
+            <div className="flex items-center gap-1.5 mr-2 border-r border-border/60 pr-2">
+              <span className="text-muted-foreground mr-1">Sources:</span>
+              <button
+                type="button"
+                onClick={() => setSourceFilter(prev => ({...prev, local: !prev.local}))}
+                className={`flex items-center gap-1 px-2 py-0.5 rounded-full border transition-colors ${sourceFilter.local ? 'bg-primary/20 border-primary/30 text-primary' : 'bg-muted border-border text-muted-foreground opacity-50'}`}
+              >
+                <Database className="w-3 h-3" /> Local
+              </button>
+              <button
+                type="button"
+                onClick={() => setSourceFilter(prev => ({...prev, github: !prev.github}))}
+                className={`flex items-center gap-1 px-2 py-0.5 rounded-full border transition-colors ${sourceFilter.github ? 'bg-primary/20 border-primary/30 text-primary' : 'bg-muted border-border text-muted-foreground opacity-50'}`}
+              >
+                <Github className="w-3 h-3" /> GitHub
+              </button>
+              <button
+                type="button"
+                onClick={() => setSourceFilter(prev => ({...prev, gmail: !prev.gmail}))}
+                className={`flex items-center gap-1 px-2 py-0.5 rounded-full border transition-colors ${sourceFilter.gmail ? 'bg-primary/20 border-primary/30 text-primary' : 'bg-muted border-border text-muted-foreground opacity-50'}`}
+              >
+                <Mail className="w-3 h-3" /> Gmail
+              </button>
+            </div>
+
+            <span className="text-muted-foreground">Tenant:</span>
+            <Badge variant="outline" className="font-mono text-[11px]">
+              {currentTenantId}
+            </Badge>
+            <span className="text-muted-foreground ml-2">User:</span>
+            <Badge variant="outline" className="font-mono text-[11px] text-primary">
+              {currentUserId}
+            </Badge>
             <div className="flex items-center gap-1.5 ml-2 border-l border-border/60 pl-2">
               <Cpu className="h-3.5 w-3.5 text-primary" />
               <select

@@ -18,8 +18,6 @@ import {
   Share2,
   Network,
   FolderPlus,
-  User,
-  Building2,
   Database,
   BookOpen,
   Terminal,
@@ -148,8 +146,8 @@ const TAB_LABELS: Record<ActiveTab, string> = {
 export function App() {
   const [activeTab, setActiveTab] = React.useState<ActiveTab>("chat");
   const [isSidebarOpen, setIsSidebarOpen] = React.useState(false);
-  const [currentTenantId, setCurrentTenantId] = React.useState("corp-default");
-  const [currentUserId, setCurrentUserId] = React.useState("alice");
+  const [currentTenantId] = React.useState("corp-default");
+  const [currentUserId] = React.useState("alice");
   const [isCommandOpen, setIsCommandOpen] = React.useState(false);
   const [isResourcePickerOpen, setIsResourcePickerOpen] = React.useState(false);
   const [initialChatQuery, setInitialChatQuery] = React.useState<string | undefined>(undefined);

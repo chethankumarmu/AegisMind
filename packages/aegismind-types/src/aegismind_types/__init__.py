@@ -175,6 +175,9 @@ class Citation(BaseModel):
     snippet: str = Field(..., description="Excerpt or snippet text supporting answer")
     score: float = Field(..., description="Relevance or reranker score")
     tenant_id: str | None = Field(default=None, description="Tenant boundary")
+    metadata: dict[str, Any] = Field(
+        default_factory=dict, description="Source-specific chunk metadata"
+    )
 
 
 class SearchResult(BaseModel):

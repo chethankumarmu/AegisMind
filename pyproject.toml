@@ -86,7 +86,11 @@ pythonpath = [
     "packages/aegismind-retrieval/src",
     "packages/aegismind-ingestion/src",
     "packages/aegismind-mcp-bridge/src",
+    "packages/aegismind-graph/src",
+    "packages/aegismind-approval/src",
     "connectors/local_filesystem/src",
+    "connectors/github/src",
+    "connectors/gmail/src",
 ]
 markers = [
     "integration: marks tests as integration tests requiring external services",

@@ -9,6 +9,8 @@ resolution-markers = [
 [manifest]
 members = [
     "aegismind-approval",
+    "aegismind-connector-github",
+    "aegismind-connector-gmail",
     "aegismind-connector-local-filesystem",
     "aegismind-connector-sdk",
     "aegismind-core",
@@ -34,6 +36,44 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "aegismind-types", editable = "packages/aegismind-types" },
+    { name = "pydantic", specifier = ">=2.10" },
+]
+
+[[package]]
+name = "aegismind-connector-github"
+version = "0.1.0"
+source = { editable = "connectors/github" }
+dependencies = [
+    { name = "aegismind-connector-sdk" },
+    { name = "aegismind-types" },
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aegismind-connector-sdk", editable = "packages/aegismind-connector-sdk" },
+    { name = "aegismind-types", editable = "packages/aegismind-types" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "pydantic", specifier = ">=2.10" },
+]
+
+[[package]]
+name = "aegismind-connector-gmail"
+version = "0.1.0"
+source = { editable = "connectors/gmail" }
+dependencies = [
+    { name = "aegismind-connector-sdk" },
+    { name = "aegismind-types" },
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aegismind-connector-sdk", editable = "packages/aegismind-connector-sdk" },
+    { name = "aegismind-types", editable = "packages/aegismind-types" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic", specifier = ">=2.10" },
 ]
 

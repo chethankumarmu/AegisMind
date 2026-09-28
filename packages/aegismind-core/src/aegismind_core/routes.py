@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, cast
 
 from aegismind_connector_sdk.ports import ConnectorPort, ConnectorSpec
+from aegismind_connector_sdk.registry import ConnectorRegistry
 from aegismind_graph.engine import KnowledgeGraphEngine
 from aegismind_infra.ports import SecretStorePort
 from aegismind_infra.secrets import MemorySecretStore
@@ -129,6 +130,9 @@ class SearchApiRequest(BaseModel):
     mmr_lambda: float = Field(default=0.7, ge=0.0, le=1.0)
     sparse_query: dict[int, float] | None = None
     pre_filter: dict[str, Any] | None = None
+    sources: list[str] | str | None = Field(
+        default=None, description="Sources to filter: 'local', 'github', 'gmail', or 'all'"
+    )
 
 
 class GroupAliasRequest(BaseModel):
@@ -139,6 +143,23 @@ class GroupAliasRequest(BaseModel):
     idp_group: str = Field(..., description="Source Identity Provider group name")
     canonical_group: str = Field(..., description="Target canonical group identifier")
     tenant_id: str | None = Field(default=None)
+
+
+class SystemModeRequest(BaseModel):
+    """Payload for setting system operational mode."""
+
+    model_config = ConfigDict(frozen=True)
+
+    air_gapped: bool = Field(..., description="True for Sovereign Air-Gapped Mode, False for Connected")
+
+
+class ConnectorConnectRequest(BaseModel):
+    """Payload for connecting a knowledge source."""
+
+    model_config = ConfigDict(frozen=True)
+
+    token: str | None = Field(default=None, description="Access token or PAT (stored securely)")
+    config: dict[str, Any] = Field(default_factory=dict, description="Connector configuration options")
 
 
 class ConnectorActionRequest(BaseModel):
@@ -354,6 +375,7 @@ class CoreState:
         )
 
         self.connectors: dict[str, ConnectorPort] = {}
+        self.connector_registry = ConnectorRegistry()
         self.group_aliases: dict[str, str] = {}
         self.audit_log: list[AuditLogEntry] = []
         self.indexed_resources: list[dict[str, Any]] = []
@@ -437,13 +459,23 @@ def create_routes(state: CoreState) -> APIRouter:
                     "user_id": principal.id,
                 },
             ):
+                # Build effective pre_filter — merge sources filter with explicit pre_filter
+                effective_pre_filter: dict[str, Any] = dict(req.pre_filter or {})
+                if req.sources and req.sources != "all":
+                    src_list = req.sources if isinstance(req.sources, list) else [req.sources]
+                    # Map frontend source labels to backend metadata source_type values
+                    type_map = {"local": "filesystem", "github": "github", "gmail": "gmail"}
+                    mapped = list({type_map.get(s, s) for s in src_list})
+                    if mapped:
+                        effective_pre_filter["source_type"] = mapped if len(mapped) > 1 else mapped[0]
+
                 result = await pipeline.execute(
                     query=req.query,
                     principal=principal,
                     chat_history=parsed_history,
                     query_type=req.query_type,
                     sparse_query=req.sparse_query,
-                    pre_filter=req.pre_filter,
+                    pre_filter=effective_pre_filter or None,
                     top_k=effective_top_k,
                     overfetch_factor=req.overfetch_factor,
                     apply_mmr=req.apply_mmr,
@@ -481,6 +513,7 @@ def create_routes(state: CoreState) -> APIRouter:
         tenant_id: str | None = Query(None, description="Tenant ID"),
         model: str | None = Query(None, description="Ollama model for answer generation"),
         top_k: int = Query(5, ge=1, le=20),
+        sources: str | None = Query(None, description="Comma-separated source filter: local,github,gmail"),
     ) -> StreamingResponse:
         pipeline = state.retrieval_pipeline
         if pipeline is None:
@@ -506,12 +539,21 @@ def create_routes(state: CoreState) -> APIRouter:
         )
         principal = Principal(id=effective_principal_id, type="user", tenant_id=tenant_id)
 
+        # Build source-type pre_filter
+        chat_pre_filter: dict[str, Any] | None = None
+        if sources and sources.lower() != "all":
+            src_list = [s.strip() for s in sources.split(",") if s.strip()]
+            type_map = {"local": "filesystem", "github": "github", "gmail": "gmail"}
+            mapped = list({type_map.get(s, s) for s in src_list})
+            if mapped:
+                chat_pre_filter = {"source_type": mapped if len(mapped) > 1 else mapped[0]}
+
         async def sse_event_stream() -> AsyncIterator[str]:
             state.record_audit(
                 event_type="chat",
                 principal_id=effective_principal_id,
                 action="chat_sse_stream",
-                metadata={"query": query, "model": model},
+                metadata={"query": query, "model": model, "sources": sources},
             )
 
             # Stage 0: Thinking progress indications
@@ -537,6 +579,7 @@ def create_routes(state: CoreState) -> APIRouter:
                     query=query,
                     principal=principal,
                     top_k=top_k,
+                    pre_filter=chat_pre_filter,
                 )
 
             # Stage 2: Token budgeting and memory retrieval
@@ -772,17 +815,34 @@ def create_routes(state: CoreState) -> APIRouter:
     # 3. GET|POST /api/v1/connectors: Spec discovery, configuration, sync triggering
     @router.get("/connectors")
     async def list_connectors() -> dict[str, Any]:
-        """Discover available connectors and their configurations."""
+        """Discover available connectors with full metadata from the registry."""
         connector_list = []
-        for name, conn in state.connectors.items():
-            spec: ConnectorSpec = conn.spec()
-            connector_list.append(
-                {
-                    "name": name,
-                    "spec": spec.model_dump(),
-                }
-            )
-        return {"connectors": connector_list}
+
+        # Merge registry registrations with raw connectors dict
+        all_ids = set(state.connectors.keys()) | {
+            r.connector_id for r in state.connector_registry.list_registrations()
+        }
+
+        for name in sorted(all_ids):
+            conn = state.connectors.get(name)
+            reg = state.connector_registry.get_registration(name)
+            spec: ConnectorSpec | None = conn.spec() if conn else None
+
+            entry: dict[str, Any] = {"name": name}
+            if spec:
+                entry["spec"] = spec.model_dump()
+            if reg:
+                entry["registration"] = reg.model_dump()
+
+            connector_list.append(entry)
+
+        return {
+            "connectors": connector_list,
+            "total": len(connector_list),
+            "mode": "SOVEREIGN / AIR-GAPPED"
+            if os.environ.get("AIR_GAPPED", "").lower() in {"1", "true", "yes"}
+            else "CONNECTED KNOWLEDGE",
+        }
 
     @router.post("/connectors")
     async def manage_connectors(req: ConnectorActionRequest) -> dict[str, Any]:
@@ -832,6 +892,187 @@ def create_routes(state: CoreState) -> APIRouter:
             "report": report.model_dump(),
         }
 
+    # 3b. GET /api/v1/connectors/{connector_id}: Get connector detail
+    @router.get("/connectors/{connector_id}")
+    async def get_connector(connector_id: str) -> dict[str, Any]:
+        """Get detailed metadata for a specific connector instance."""
+        conn = state.connectors.get(connector_id)
+        reg = state.connector_registry.get_registration(connector_id)
+
+        if conn is None and reg is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Connector '{connector_id}' not found",
+            )
+
+        result: dict[str, Any] = {"connector_id": connector_id}
+        if conn:
+            result["spec"] = conn.spec().model_dump()
+        if reg:
+            result["registration"] = reg.model_dump()
+        return result
+
+    # 3c. POST /api/v1/connectors/{connector_id}/sync: Trigger sync for a connector
+    @router.post("/connectors/{connector_id}/sync")
+    async def sync_connector(
+        connector_id: str,
+        initial_cursor: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Trigger an incremental sync for a specific connector instance."""
+        connector = state.connectors.get(connector_id)
+        if connector is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Connector '{connector_id}' not found",
+            )
+        if state.scribe_worker is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Scribe worker is not configured (no ingestion pipeline)",
+            )
+
+        run_id = f"sync_{connector_id}_{uuid.uuid4().hex[:8]}"
+        state.record_audit(
+            event_type="connector",
+            principal_id="system",
+            action="SYNC_START",
+            resource_id=connector_id,
+            metadata={"run_id": run_id, "connector_type": connector.spec().name},
+        )
+
+        # Record the sync start in the LocalTools activity system so it appears in the UI
+        activity_event_id = state.activity_recorder.record_start(
+            tool_name=f"{connector_id.upper()}_SYNC",
+            category="knowledge",
+            parameters={
+                "connector_id": connector_id,
+                "connector_type": connector.spec().name,
+                "run_id": run_id,
+            },
+            agent_id="system",
+        )
+
+        try:
+            report: ScribeSyncReport = await state.scribe_worker.run_sync(
+                run_id=run_id,
+                connector=connector,
+                initial_cursor=initial_cursor,
+            )
+            state.record_audit(
+                event_type="connector",
+                principal_id="system",
+                action="SYNC_COMPLETE" if report.status == "COMPLETED" else "SYNC_FAILED",
+                resource_id=connector_id,
+                metadata={
+                    "run_id": run_id,
+                    "records_synced": report.records_synced,
+                    "chunks_indexed": report.chunks_indexed,
+                    "status": report.status,
+                },
+            )
+            # Record completion in activity system
+            state.activity_recorder.record_complete(
+                event_id=activity_event_id.event_id,
+                result_summary=(
+                    f"Synced {report.records_synced} records, "
+                    f"{report.chunks_indexed} chunks indexed"
+                ),
+                metadata={
+                    "records_synced": report.records_synced,
+                    "chunks_indexed": report.chunks_indexed,
+                    "status": report.status,
+                },
+            )
+            return {"status": report.status, "report": report.model_dump()}
+        except Exception as exc:
+            state.record_audit(
+                event_type="connector",
+                principal_id="system",
+                action="SYNC_FAILED",
+                resource_id=connector_id,
+                metadata={"run_id": run_id, "error": str(exc)},
+            )
+            state.activity_recorder.record_complete(
+                event_id=activity_event_id.event_id,
+                result_summary=f"Sync failed: {exc}",
+                metadata={"error": str(exc), "status": "FAILED"},
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Sync failed: {exc}",
+            ) from exc
+
+    # 3d. GET /api/v1/connectors/{connector_id}/status: Get connector sync status
+    @router.get("/connectors/{connector_id}/status")
+    async def get_connector_status(connector_id: str) -> dict[str, Any]:
+        """Get synchronization status for a specific connector."""
+        reg = state.connector_registry.get_registration(connector_id)
+        conn = state.connectors.get(connector_id)
+
+        if reg is None and conn is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Connector '{connector_id}' not found",
+            )
+
+        result: dict[str, Any] = {
+            "connector_id": connector_id,
+            "status": reg.status if reg else "registered",
+            "indexed_documents": reg.indexed_documents if reg else 0,
+            "indexed_chunks": reg.indexed_chunks if reg else 0,
+            "last_sync_at": reg.last_sync_at if reg else None,
+        }
+        if reg and reg.sync_status:
+            result["sync_status"] = reg.sync_status.model_dump()
+        return result
+
+    # 3e. GET /api/v1/connectors/{connector_id}/sources: List connector sources
+    @router.get("/connectors/{connector_id}/sources")
+    async def list_connector_sources(connector_id: str) -> dict[str, Any]:
+        """List available sources (repos, mailboxes, folders) for a connector."""
+        conn = state.connectors.get(connector_id)
+        if conn is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Connector '{connector_id}' not found",
+            )
+
+        if not hasattr(conn, "list_sources"):
+            # Connector does not support source listing (e.g. local filesystem)
+            spec = conn.spec()
+            return {
+                "connector_id": connector_id,
+                "sources": [
+                    {
+                        "source_id": connector_id,
+                        "display_name": spec.description or spec.name,
+                        "source_type": spec.name,
+                    }
+                ],
+                "total": 1,
+            }
+
+        try:
+            from aegismind_connector_sdk.network_guard import (  # noqa: PLC0415
+                get_network_guard,
+            )
+
+            guard = get_network_guard()
+            spec = conn.spec()
+            if spec.network_required:
+                guard.assert_network_allowed(connector_id)
+            sources = await conn.list_sources()  # type: ignore[attr-defined]
+            return {
+                "connector_id": connector_id,
+                "sources": [s.model_dump() for s in sources],
+                "total": len(sources),
+            }
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Failed to list sources: {exc}",
+            ) from exc
+
     # 4. GET /api/v1/resources: Browsing indexed resources
     @router.get("/resources")
     async def list_resources(
@@ -851,6 +1092,66 @@ def create_routes(state: CoreState) -> APIRouter:
             "limit": limit,
             "offset": offset,
             "resources": paged,
+        }
+    # 3f. POST /api/v1/connectors/{connector_id}/connect: Provide credentials and connect
+    @router.post("/connectors/{connector_id}/connect")
+    async def connect_connector(connector_id: str, req: ConnectorConnectRequest) -> dict[str, Any]:
+        """Provide credentials/token to authenticate and activate a connector."""
+        conn = state.connectors.get(connector_id)
+        if conn is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Connector '{connector_id}' not found",
+            )
+        # Store the provided token in the secret store
+        if req.token:
+            secret_key = f"{connector_id}_token"
+            await state.secret_store.set(secret_key, req.token)
+
+        # Persist any additional config entries as secrets
+        for key, value in (req.config or {}).items():
+            await state.secret_store.set(f"{connector_id}_{key}", str(value))
+
+        # Update registration status
+        reg = state.connector_registry.get_registration(connector_id)
+        if reg:
+            reg.status = "connected"
+
+        state.record_audit(
+            event_type="connector",
+            principal_id="system",
+            action="CONNECTOR_CONNECTED",
+            resource_id=connector_id,
+            metadata={"token_provided": bool(req.token)},
+        )
+        return {"status": "connected", "connector_id": connector_id}
+
+    # 3g. GET|POST /api/v1/system/mode: Inspect and update sovereign/connected mode
+    @router.get("/system/mode")
+    async def get_system_mode() -> dict[str, Any]:
+        """Return the current system mode (sovereign / connected)."""
+        air_gapped = os.environ.get("AIR_GAPPED", "false").lower() in ("1", "true", "yes")
+        return {
+            "air_gapped": air_gapped,
+            "mode_label": "SOVEREIGN (AIR-GAPPED)" if air_gapped else "CONNECTED",
+            "external_connectors_enabled": not air_gapped,
+        }
+
+    @router.post("/system/mode")
+    async def set_system_mode(req: SystemModeRequest) -> dict[str, Any]:
+        """Toggle the system between sovereign (air-gapped) and connected modes."""
+        os.environ["AIR_GAPPED"] = "true" if req.air_gapped else "false"
+        air_gapped = req.air_gapped
+        state.record_audit(
+            event_type="system",
+            principal_id="admin",
+            action="SET_SYSTEM_MODE",
+            metadata={"air_gapped": air_gapped},
+        )
+        return {
+            "air_gapped": air_gapped,
+            "mode_label": "SOVEREIGN (AIR-GAPPED)" if air_gapped else "CONNECTED",
+            "external_connectors_enabled": not air_gapped,
         }
 
     # 5. GET|POST /api/v1/group-aliases: Manage identity group mappings

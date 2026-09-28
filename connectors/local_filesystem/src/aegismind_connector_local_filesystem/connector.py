@@ -1,3 +1,23 @@
+"""Local Filesystem Connector — Sovereign, air-gapped, incremental knowledge source.
+
+This connector indexes local files into the AegisMind RAG pipeline without any
+external network calls. It is the primary connector for sovereign / air-gapped mode.
+
+Key features:
+- Sensitive path denylist (never indexes credentials, private keys, .env files)
+- Ignore patterns (.git, node_modules, __pycache__, dist, build, etc.)
+- Supported text extensions allowlist
+- SHA-256 content-hash incremental sync (skip unchanged files)
+- Tombstone records for deleted files (enables soft-delete in vector store)
+- Rich source metadata preserved through the ingestion pipeline
+- Full compatibility with the existing AegisMind Record → ingestion pipeline flow
+
+Security:
+- This connector NEVER makes network requests.
+- It NEVER indexes files matching the sensitive denylist.
+- air_gapped_capable = True (always permitted in sovereign mode).
+"""
+
 from __future__ import annotations
 
 import fnmatch
@@ -9,6 +29,12 @@ from pathlib import Path
 from typing import Any
 
 from aegismind_connector_sdk.ports import ConnectorPort, ConnectorSpec
+from aegismind_connector_sdk.source_identity import (
+    IncrementalSyncState,
+    compute_document_id,
+    detect_change,
+    detect_deletions,
+)
 from aegismind_types import ACL, Record
 
 logger = logging.getLogger(__name__)
@@ -108,7 +134,23 @@ def compute_file_hash(path: Path) -> str:
 
 
 class LocalFilesystemConnector(ConnectorPort):
-    """Sovereign local filesystem connector with sensitive path denylist and incremental sync."""
+    """Sovereign local filesystem connector with sensitive path denylist and incremental sync.
+
+    This connector is:
+    - air_gapped_capable = True (always allowed in sovereign mode)
+    - network_required = False (never makes external network calls)
+    - source_type = "filesystem"
+
+    Metadata preserved in every Record for RAG citations:
+        source_type = "filesystem"
+        file_path = /absolute/path/to/file
+        relative_path = path/relative/to/watch_root
+        uri = file:///absolute/path/to/file
+        content_hash = sha256(content)
+        size_bytes = int
+    """
+
+    CONNECTOR_TYPE = "local_filesystem"
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self.config = config or {}
@@ -126,11 +168,12 @@ class LocalFilesystemConnector(ConnectorPort):
 
     def spec(self) -> ConnectorSpec:
         return ConnectorSpec(
-            name="local_filesystem",
-            version="0.0.1",
+            name=self.CONNECTOR_TYPE,
+            version="0.1.0",
             description=(
                 "Sovereign local filesystem connector with sensitive file denylist "
-                "and SHA-256 content-hash incremental synchronization"
+                "and SHA-256 content-hash incremental synchronization. "
+                "Fully air-gapped capable. No network access required."
             ),
             config_schema={
                 "type": "object",
@@ -142,6 +185,12 @@ class LocalFilesystemConnector(ConnectorPort):
                 },
             },
             supports_incremental=True,
+            supported_auth=["none"],
+            network_required=False,
+            air_gapped_capable=True,
+            processing_location="local",
+            embedding_location="local",
+            vector_store_location="local",
         )
 
     async def check(self) -> bool:
@@ -168,8 +217,17 @@ class LocalFilesystemConnector(ConnectorPort):
         self,
         state: dict[str, Any] | None = None,
     ) -> AsyncIterator[Record]:
-        """Read files incrementally using SHA-256 content hashing."""
-        previous_hashes: dict[str, str] = (state or {}).get("content_hashes", {})
+        """Read files incrementally using SHA-256 content hashing.
+
+        State dict keys (for incremental sync):
+            content_hashes: dict[canonical_path, sha256_hash]
+
+        Yields:
+            Record with source_type=filesystem metadata for each new/modified file.
+            Tombstone Records for deleted files (is_tombstone=True).
+        """
+        sync_state = IncrementalSyncState.from_cursor_dict(state)
+        previous_hashes: dict[str, str] = dict(sync_state.content_hashes)
         seen_paths: set[str] = set()
 
         for root in self.watch_paths:
@@ -210,9 +268,8 @@ class LocalFilesystemConnector(ConnectorPort):
                     logger.warning("Could not read file %s for hashing: %s", file_path, exc)
                     continue
 
-                prev_hash = previous_hashes.get(canonical_path)
-                if prev_hash == content_hash:
-                    # Content unchanged, skip re-indexing
+                change_state = detect_change(canonical_path, content_hash, previous_hashes)
+                if change_state == "UNCHANGED":
                     logger.debug("File %s unchanged (hash: %s); skipping", file_path, content_hash)
                     continue
 
@@ -227,12 +284,11 @@ class LocalFilesystemConnector(ConnectorPort):
                 mtime_dt = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
                 ctime_dt = datetime.fromtimestamp(stat.st_ctime, tz=UTC)
 
-                raw_hash = hashlib.md5(canonical_path.encode(), usedforsecurity=False).hexdigest()
-                record_id = f"localfs_{raw_hash[:16]}"
+                document_id = compute_document_id(self.CONNECTOR_TYPE, canonical_path)
 
                 yield Record(
-                    id=record_id,
-                    source="local_filesystem",
+                    id=document_id,
+                    source=self.CONNECTOR_TYPE,
                     external_id=canonical_path,
                     payload={
                         "title": file_path.name,
@@ -242,6 +298,10 @@ class LocalFilesystemConnector(ConnectorPort):
                         "relative_path": rel_str,
                         "content_hash": content_hash,
                         "size_bytes": stat.st_size,
+                        # Source identity metadata for RAG citations
+                        "source_type": "filesystem",
+                        "file_path": canonical_path,
+                        "change_state": change_state,
                     },
                     acl=ACL(
                         is_public=False,
@@ -252,22 +312,24 @@ class LocalFilesystemConnector(ConnectorPort):
                 )
 
         # Detect deleted files for soft-delete tombstones
-        for prev_path in list(previous_hashes.keys()):
-            if prev_path not in seen_paths:
-                del_hash = hashlib.md5(prev_path.encode(), usedforsecurity=False).hexdigest()
-                record_id = f"localfs_{del_hash[:16]}"
-                logger.info("File %s deleted from local filesystem; yielding tombstone", prev_path)
-                yield Record(
-                    id=record_id,
-                    source="local_filesystem",
-                    external_id=prev_path,
-                    payload={
-                        "title": Path(prev_path).name,
-                        "content": "",
-                        "is_tombstone": True,
-                        "path": prev_path,
-                    },
-                    acl=ACL(is_public=False, allowed_principals=[]),
-                    created_at=datetime.now(UTC),
-                    updated_at=datetime.now(UTC),
-                )
+        deleted_ids = detect_deletions(seen_paths, previous_hashes)
+        for prev_path in deleted_ids:
+            document_id = compute_document_id(self.CONNECTOR_TYPE, prev_path)
+            logger.info("File %s deleted from local filesystem; yielding tombstone", prev_path)
+            yield Record(
+                id=document_id,
+                source=self.CONNECTOR_TYPE,
+                external_id=prev_path,
+                payload={
+                    "title": Path(prev_path).name,
+                    "content": "",
+                    "is_tombstone": True,
+                    "path": prev_path,
+                    "source_type": "filesystem",
+                    "file_path": prev_path,
+                    "change_state": "DELETED",
+                },
+                acl=ACL(is_public=False, allowed_principals=[]),
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
