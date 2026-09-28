@@ -426,40 +426,8 @@ export function App() {
               ))}
             </div>
 
-            {/* Drawer Footer: Scope Switcher & System Status */}
+            {/* Drawer Footer: System Status */}
             <div className="p-3 border-t border-border/70 bg-card/60 space-y-2 text-xs">
-              <div className="space-y-1.5 p-2 rounded-lg bg-secondary/60 border border-border/60">
-                <div className="flex items-center justify-between text-[11px] text-muted-foreground">
-                  <span className="flex items-center gap-1">
-                    <Building2 className="h-3 w-3" /> Tenant
-                  </span>
-                  <select
-                    value={currentTenantId}
-                    onChange={(e) => setCurrentTenantId(e.target.value)}
-                    className="bg-transparent text-[11px] font-mono text-foreground focus:outline-none cursor-pointer"
-                  >
-                    <option value="corp-default" className="bg-card">corp-default</option>
-                    <option value="tenant-finance" className="bg-card">tenant-finance</option>
-                    <option value="tenant-external" className="bg-card">tenant-external</option>
-                  </select>
-                </div>
-
-                <div className="flex items-center justify-between text-[11px] text-muted-foreground">
-                  <span className="flex items-center gap-1">
-                    <User className="h-3 w-3 text-primary" /> User
-                  </span>
-                  <select
-                    value={currentUserId}
-                    onChange={(e) => setCurrentUserId(e.target.value)}
-                    className="bg-transparent text-[11px] font-mono text-primary font-medium focus:outline-none cursor-pointer"
-                  >
-                    <option value="alice" className="bg-card">alice (eng)</option>
-                    <option value="bob" className="bg-card">bob (contractor)</option>
-                    <option value="charlie" className="bg-card">charlie (finance)</option>
-                  </select>
-                </div>
-              </div>
-
               <div className="flex items-center justify-between px-1 text-[10px] text-muted-foreground">
                 <span className="flex items-center gap-1.5">
                   <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />

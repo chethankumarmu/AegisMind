@@ -263,14 +263,6 @@ export function Search({ currentTenantId, currentUserId }: SearchProps) {
                     {(selectedPreview.score * 100).toFixed(2)}%
                   </span>
                 </div>
-                <div className="flex justify-between py-1 border-b border-border/30">
-                  <span className="text-muted-foreground">Tenant Isolation:</span>
-                  <span className="font-mono text-foreground">{currentTenantId}</span>
-                </div>
-                <div className="flex justify-between py-1 border-b border-border/30">
-                  <span className="text-muted-foreground">Evaluated Subject:</span>
-                  <span className="font-mono text-foreground">user:{currentUserId}</span>
-                </div>
               </div>
             </div>
 

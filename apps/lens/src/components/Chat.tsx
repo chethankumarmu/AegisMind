@@ -19,7 +19,12 @@ import {
   Paperclip,
   X,
   CornerDownRight,
+  Mic,
+  MicOff,
+  Volume2,
+  VolumeX,
 } from "lucide-react";
+import SpeechRecognition, { useSpeechRecognition } from 'react-speech-recognition';
 
 interface AttachedFile {
   id: string;
@@ -92,9 +97,138 @@ export function Chat({
   // When recallMode is true the user is asking the agent to retrieve answers
   // from past conversation memory across all chatboxes
   const [recallMode, setRecallMode] = React.useState(false);
+  const [isListening, setIsListening] = React.useState(false);
+  const [autoSpeak, setAutoSpeak] = React.useState(true);
+  const [isSpeaking, setIsSpeaking] = React.useState(false);
+  const [speakingMsgId, setSpeakingMsgId] = React.useState<string | null>(null);
+  const [speechErrorMsg, setSpeechErrorMsg] = React.useState<string | null>(null);
+  
+  // Microphone via react-speech-recognition
+  const {
+    transcript,
+    listening,
+    resetTranscript,
+    browserSupportsSpeechRecognition,
+    isMicrophoneAvailable
+  } = useSpeechRecognition();
+  
+  const baselineTextRef = React.useRef("");
   const abortStreamRef = React.useRef<(() => void) | null>(null);
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+
+  React.useEffect(() => {
+    return () => {
+      if (listening) {
+        SpeechRecognition.stopListening();
+      }
+      if ("speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
+    };
+  }, [listening]);
+
+  // Sync transcript to input box
+  React.useEffect(() => {
+    if (listening) {
+      const newQuery = `${baselineTextRef.current} ${transcript}`.trim();
+      setInputQuery(newQuery);
+    }
+  }, [transcript, listening]);
+
+  const speakMessage = (msgId: string, text: string) => {
+    if (!("speechSynthesis" in window)) {
+      alert("Text-to-speech is not supported in this browser.");
+      return;
+    }
+
+    if (isSpeaking && speakingMsgId === msgId) {
+      window.speechSynthesis.cancel();
+      setIsSpeaking(false);
+      setSpeakingMsgId(null);
+      return;
+    }
+
+    window.speechSynthesis.cancel();
+    
+    // Short timeout to ensure cancel finishes before speaking starts
+    setTimeout(() => {
+      const cleanText = text
+        .replace(/```[\s\S]*?```/g, " Code block omitted. ")
+        .replace(/`([^`]+)`/g, "$1")
+        .replace(/[*_#\-]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      if (!cleanText) return;
+
+      const utterance = new SpeechSynthesisUtterance(cleanText);
+      utterance.rate = 1.0;
+      utterance.pitch = 1.0;
+
+      const voices = window.speechSynthesis.getVoices();
+      const preferredVoice =
+        voices.find(
+          (v) =>
+            v.lang.startsWith("en") &&
+            (v.name.includes("Natural") ||
+              v.name.includes("Google") ||
+              v.name.includes("Samantha") ||
+              v.name.includes("Alex"))
+        ) || voices.find((v) => v.lang.startsWith("en"));
+      if (preferredVoice) {
+        utterance.voice = preferredVoice;
+      }
+
+      utterance.onend = () => {
+        setIsSpeaking(false);
+        setSpeakingMsgId(null);
+      };
+
+      utterance.onerror = () => {
+        setIsSpeaking(false);
+        setSpeakingMsgId(null);
+      };
+
+      setIsSpeaking(true);
+      setSpeakingMsgId(msgId);
+      window.speechSynthesis.speak(utterance);
+
+      // Workaround for Chrome bug where onend never fires for long utterances
+      const resumeInterval = setInterval(() => {
+        if (!window.speechSynthesis.speaking) {
+          clearInterval(resumeInterval);
+        } else {
+          window.speechSynthesis.pause();
+          window.speechSynthesis.resume();
+        }
+      }, 10000);
+
+      utterance.addEventListener('end', () => clearInterval(resumeInterval));
+      utterance.addEventListener('error', () => clearInterval(resumeInterval));
+    }, 50);
+  };
+
+  const stopMicrophone = React.useCallback(() => {
+    SpeechRecognition.stopListening();
+  }, []);
+
+  const toggleListening = () => {
+    setSpeechErrorMsg(null);
+
+    if (!browserSupportsSpeechRecognition) {
+      setSpeechErrorMsg("Speech recognition is not supported in this browser. Please use Chrome.");
+      return;
+    }
+
+    if (listening) {
+      SpeechRecognition.stopListening();
+    } else {
+      baselineTextRef.current = inputQuery.trim();
+      resetTranscript();
+      SpeechRecognition.startListening({ continuous: true });
+    }
+  };
 
 
   const scrollToBottom = () => {
@@ -153,6 +287,10 @@ export function Chat({
 
   const handleSend = async () => {
     if ((!inputQuery.trim() && attachedFiles.length === 0) || isStreaming) return;
+
+    if (isListening) {
+      stopMicrophone();
+    }
 
     const userMsgId = `user-${Date.now()}`;
     const assistantMsgId = `asst-${Date.now()}`;
@@ -270,6 +408,11 @@ export function Chat({
               timestamp: new Date().toISOString(),
             },
           });
+
+          // Automatically speak back response if autoSpeak is active
+          if (autoSpeak) {
+            speakMessage(assistantMsgId, accumulatedResponse);
+          }
         }
       },
       onError: (err) => {
@@ -316,14 +459,33 @@ export function Chat({
             </span>
           </div>
           <div className="flex items-center gap-2 text-xs">
-            <span className="text-muted-foreground">Tenant:</span>
-            <Badge variant="outline" className="font-mono text-[11px]">
-              {currentTenantId}
-            </Badge>
-            <span className="text-muted-foreground ml-2">User:</span>
-            <Badge variant="outline" className="font-mono text-[11px] text-primary">
-              {currentUserId}
-            </Badge>
+            {/* Auto-Voice Response Toggle */}
+            <button
+              type="button"
+              onClick={() => {
+                const next = !autoSpeak;
+                setAutoSpeak(next);
+                if (!next && "speechSynthesis" in window) {
+                  window.speechSynthesis.cancel();
+                  setIsSpeaking(false);
+                  setSpeakingMsgId(null);
+                }
+              }}
+              className={`flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] font-medium border transition-colors ${
+                autoSpeak
+                  ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-600 dark:text-emerald-400"
+                  : "bg-secondary/60 border-border text-muted-foreground hover:text-foreground"
+              }`}
+              title="Toggle automatic voice response readback"
+            >
+              {autoSpeak ? (
+                <Volume2 className="h-3.5 w-3.5 text-emerald-500" />
+              ) : (
+                <VolumeX className="h-3.5 w-3.5 text-muted-foreground" />
+              )}
+              <span>{autoSpeak ? "Voice Output ON" : "Voice Output OFF"}</span>
+            </button>
+
             <div className="flex items-center gap-1.5 ml-2 border-l border-border/60 pl-2">
               <Cpu className="h-3.5 w-3.5 text-primary" />
               <select
@@ -401,6 +563,39 @@ export function Chat({
                   {escapeHtml(msg.content)}
                 </div>
 
+                {/* Read Aloud Voice Back Button for Assistant Messages */}
+                {msg.role === "assistant" && msg.content && (
+                  <div className="mt-2.5 pt-1.5 border-t border-border/50 flex items-center justify-between">
+                    <button
+                      type="button"
+                      onClick={() => speakMessage(msg.id, msg.content)}
+                      className={`flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-medium transition-colors ${
+                        speakingMsgId === msg.id
+                          ? "bg-rose-500/15 text-rose-600 dark:text-rose-400 font-semibold"
+                          : "text-muted-foreground hover:text-foreground hover:bg-secondary"
+                      }`}
+                      title="Read answer back aloud"
+                    >
+                      {speakingMsgId === msg.id ? (
+                        <>
+                          <VolumeX className="h-3.5 w-3.5 text-rose-500" />
+                          <span>Stop Voice</span>
+                        </>
+                      ) : (
+                        <>
+                          <Volume2 className="h-3.5 w-3.5 text-primary" />
+                          <span>Voice Back</span>
+                        </>
+                      )}
+                    </button>
+                    {speakingMsgId === msg.id && (
+                      <span className="text-[10px] text-emerald-500 animate-pulse font-medium">
+                        Speaking response...
+                      </span>
+                    )}
+                  </div>
+                )}
+
 
 
                 <div
@@ -471,6 +666,41 @@ export function Chat({
             </div>
           )}
 
+          {/* Speech Error Warning Banner */}
+          {speechErrorMsg && (
+            <div className="mb-2 px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 flex items-center gap-2 text-xs text-amber-600 dark:text-amber-400 animate-in fade-in-50 duration-150">
+              <MicOff className="h-3.5 w-3.5 shrink-0 text-amber-500" />
+              <span className="flex-1 font-medium">{speechErrorMsg}</span>
+              <button
+                type="button"
+                onClick={() => setSpeechErrorMsg(null)}
+                className="text-amber-400 hover:text-amber-600 ml-1"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
+
+          {/* Voice Input Listening Active Banner */}
+          {listening && (
+            <div className="mb-2 px-3 py-1.5 rounded-lg bg-rose-500/10 border border-rose-500/30 flex items-center gap-2 text-xs text-rose-600 dark:text-rose-400 animate-in fade-in-50 duration-150">
+              <Mic className="h-3.5 w-3.5 shrink-0 animate-pulse text-rose-500" />
+              <span className="flex-1 font-medium">
+                {isMicrophoneAvailable === false
+                  ? "Microphone access denied. Please allow permissions."
+                  : "Voice input active: Listening... Speak into your microphone."}
+              </span>
+              <button
+                type="button"
+                onClick={toggleListening}
+                className="text-rose-400 hover:text-rose-600 ml-1"
+                title="Stop voice input"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
+
           {/* Memory Recall Mode Banner */}
           {recallMode && (
             <div className="mb-2 px-3 py-1.5 rounded-lg bg-violet-500/10 border border-violet-500/30 flex items-center gap-2 text-xs text-violet-600 dark:text-violet-400 animate-in fade-in-50 duration-150">
@@ -517,6 +747,34 @@ export function Chat({
               <Paperclip className="h-2.5 w-2.5 text-primary absolute bottom-1.5 right-1.5 opacity-80" />
             </button>
 
+            {/* Microphone Voice Input Button */}
+            <button
+              type="button"
+              onClick={toggleListening}
+              className={`h-10 w-10 shrink-0 rounded-lg flex items-center justify-center border transition-all shadow-2xs relative ${
+                listening
+                  ? "bg-rose-500/20 border-rose-500/60 text-rose-600 dark:text-rose-400 animate-pulse ring-2 ring-rose-500/30"
+                  : "text-muted-foreground hover:text-foreground hover:bg-secondary border-border/70 hover:border-border"
+              }`}
+              title={
+                listening
+                  ? "Listening... Click to stop voice input"
+                  : "Voice input (Click to speak)"
+              }
+            >
+              {listening ? (
+                <Mic className="h-4.5 w-4.5 text-rose-500 animate-bounce" />
+              ) : (
+                <Mic className="h-4.5 w-4.5 text-foreground/80 hover:scale-110 transition-transform" />
+              )}
+              {listening && (
+                <span className="absolute -top-1 -right-1 flex h-3 w-3">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-3 w-3 bg-rose-500"></span>
+                </span>
+              )}
+            </button>
+
             {/* Memory Recall Arrow Button */}
             <button
               type="button"
@@ -540,7 +798,13 @@ export function Chat({
                   : "Ask anything (e.g. How does zero stale read revocation work?)..."
               }
               value={inputQuery}
-              onChange={(e) => setInputQuery(e.target.value)}
+              onChange={(e) => {
+                setInputQuery(e.target.value);
+                if (listening) {
+                  baselineTextRef.current = e.target.value;
+                  resetTranscript();
+                }
+              }}
               disabled={isStreaming}
               className={`flex-1 bg-background/90 ${recallMode ? "border-violet-500/40 focus-visible:ring-violet-500/40" : ""}`}
             />
@@ -614,7 +878,7 @@ export function Chat({
 
             <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/20 p-2.5 text-xs text-emerald-600 dark:text-emerald-400 flex items-center gap-2">
               <Shield className="h-4 w-4 shrink-0" />
-              <span>Sovereign policy check passed for user {currentUserId}</span>
+              <span>Sovereign policy check passed</span>
             </div>
           </div>
 
