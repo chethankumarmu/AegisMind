@@ -301,6 +301,33 @@ export async function setSystemMode(air_gapped: boolean): Promise<SystemMode> {
   return response.json();
 }
 
+export type OAuthProviderName = "github" | "google";
+
+export interface OAuthProviderStatus {
+  configured: boolean;
+}
+
+export interface OAuthStatus {
+  github: OAuthProviderStatus;
+  google: OAuthProviderStatus;
+}
+
+export function getOAuthStartUrl(provider: OAuthProviderName): string {
+  return `${API_BASE}/oauth/${provider}/start`;
+}
+
+export async function getOAuthStatus(): Promise<OAuthStatus> {
+  try {
+    const response = await fetch(`${API_BASE}/oauth/status`);
+    if (!response.ok) {
+      return { github: { configured: false }, google: { configured: false } };
+    }
+    return response.json();
+  } catch {
+    return { github: { configured: false }, google: { configured: false } };
+  }
+}
+
 export async function checkAccessGraph(user_id: string, tenant_id: string): Promise<AccessRelation[]> {
   try {
     const response = await fetch(`${API_BASE}/access/graph?user_id=${encodeURIComponent(user_id)}&tenant_id=${encodeURIComponent(tenant_id)}`);

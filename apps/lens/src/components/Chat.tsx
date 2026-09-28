@@ -20,9 +20,6 @@ import {
   MicOff,
   Volume2,
   VolumeX,
-  Database,
-  Github,
-  Mail,
   Plus,
   Square,
   Send,
@@ -100,8 +97,6 @@ export function Chat({
   // When recallMode is true the user is asking the agent to retrieve answers
   // from past conversation memory across all chatboxes
   const [recallMode, setRecallMode] = React.useState(false);
-  const [sourceFilter, setSourceFilter] = React.useState({ local: true, github: true, gmail: true });
-  const [autoSpeak, setAutoSpeak] = React.useState(true);
   const [isSpeaking, setIsSpeaking] = React.useState(false);
   const [speakingMsgId, setSpeakingMsgId] = React.useState<string | null>(null);
   const [speechErrorMsg, setSpeechErrorMsg] = React.useState<string | null>(null);
@@ -365,16 +360,11 @@ export function Chat({
     let accumulatedResponse = "";
 
 
-    const activeSources = Object.entries(sourceFilter)
-      .filter(([_, active]) => active)
-      .map(([key]) => key);
-
     const cancel = streamChat({
       query: fullQuery,
       tenant_id: currentTenantId,
       user_id: currentUserId,
       model: selectedModel || undefined,
-      sources: activeSources,
 
       onThinking: (status) => {
         setCurrentThinking(status);
@@ -417,11 +407,6 @@ export function Chat({
               timestamp: new Date().toISOString(),
             },
           });
-
-          // Automatically speak back response if autoSpeak is active
-          if (autoSpeak) {
-            speakMessage(assistantMsgId, accumulatedResponse);
-          }
         }
       },
       onError: (err) => {
@@ -468,57 +453,6 @@ export function Chat({
             </span>
           </div>
           <div className="flex items-center gap-2 text-xs">
-            <button
-              type="button"
-              onClick={() => {
-                const next = !autoSpeak;
-                setAutoSpeak(next);
-                if (!next && "speechSynthesis" in window) {
-                  window.speechSynthesis.cancel();
-                  setIsSpeaking(false);
-                  setSpeakingMsgId(null);
-                }
-              }}
-              className={`flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] font-medium border transition-colors ${
-                autoSpeak
-                  ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-600 dark:text-emerald-400"
-                  : "bg-secondary/60 border-border text-muted-foreground hover:text-foreground"
-              }`}
-              title="Toggle automatic voice response readback"
-            >
-              {autoSpeak ? (
-                <Volume2 className="h-3.5 w-3.5 text-emerald-500" />
-              ) : (
-                <VolumeX className="h-3.5 w-3.5 text-muted-foreground" />
-              )}
-              <span>{autoSpeak ? "Voice Output ON" : "Voice Output OFF"}</span>
-            </button>
-
-            <div className="flex items-center gap-1.5 mr-2 border-r border-border/60 pr-2">
-              <span className="text-muted-foreground mr-1">Sources:</span>
-              <button
-                type="button"
-                onClick={() => setSourceFilter(prev => ({...prev, local: !prev.local}))}
-                className={`flex items-center gap-1 px-2 py-0.5 rounded-full border transition-colors ${sourceFilter.local ? 'bg-primary/20 border-primary/30 text-primary' : 'bg-muted border-border text-muted-foreground opacity-50'}`}
-              >
-                <Database className="w-3 h-3" /> Local
-              </button>
-              <button
-                type="button"
-                onClick={() => setSourceFilter(prev => ({...prev, github: !prev.github}))}
-                className={`flex items-center gap-1 px-2 py-0.5 rounded-full border transition-colors ${sourceFilter.github ? 'bg-primary/20 border-primary/30 text-primary' : 'bg-muted border-border text-muted-foreground opacity-50'}`}
-              >
-                <Github className="w-3 h-3" /> GitHub
-              </button>
-              <button
-                type="button"
-                onClick={() => setSourceFilter(prev => ({...prev, gmail: !prev.gmail}))}
-                className={`flex items-center gap-1 px-2 py-0.5 rounded-full border transition-colors ${sourceFilter.gmail ? 'bg-primary/20 border-primary/30 text-primary' : 'bg-muted border-border text-muted-foreground opacity-50'}`}
-              >
-                <Mail className="w-3 h-3" /> Gmail
-              </button>
-            </div>
-
             <span className="text-muted-foreground">Tenant:</span>
             <Badge variant="outline" className="font-mono text-[11px]">
               {currentTenantId}

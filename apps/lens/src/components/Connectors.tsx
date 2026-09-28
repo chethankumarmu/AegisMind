@@ -3,7 +3,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from "@/components/ui/card";
-import { Switch } from "@/components/ui/switch";
 import {
   Dialog,
   DialogContent,
@@ -12,14 +11,22 @@ import {
   DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog";
-import { 
-  listConnectors, 
-  triggerSync, 
-  getSystemMode, 
-  setSystemMode, 
+import {
+  listConnectors,
+  triggerSync,
+  getSystemMode,
+  setSystemMode,
   connectConnector,
+  getOAuthStartUrl,
+  getOAuthStatus,
+  listIndexedResources,
+  uploadDocumentFile,
+  deleteDocument,
+  ingestDocument,
   type ConnectorInfo,
-  type SystemMode
+  type SystemMode,
+  type OAuthStatus,
+  type ResourceItem,
 } from "@/lib/api";
 import {
   RefreshCw,
@@ -35,7 +42,10 @@ import {
   FileText,
   Github,
   Mail,
-  FolderOpen
+  FolderOpen,
+  UploadCloud,
+  Trash2,
+  AlertCircle,
 } from "lucide-react";
 
 const getIconForConnector = (name: string) => {
@@ -46,51 +56,102 @@ const getIconForConnector = (name: string) => {
   return <FileText className="h-5 w-5" />;
 };
 
+function catalogMatch(name: string, airGapped: boolean): boolean {
+  const n = name.toLowerCase();
+  if (airGapped) {
+    return n.includes("local");
+  }
+  return n.includes("github") || n.includes("gmail");
+}
+
 export function Connectors() {
   const [connectors, setConnectors] = React.useState<ConnectorInfo[]>([]);
   const [systemMode, setSystemModeState] = React.useState<SystemMode | null>(null);
+  const [oauthStatus, setOauthStatus] = React.useState<OAuthStatus>({
+    github: { configured: false },
+    google: { configured: false },
+  });
   const [searchQuery, setSearchQuery] = React.useState("");
-  const [statusFilter, setStatusFilter] = React.useState<string>("all");
   const [selectedConnector, setSelectedConnector] = React.useState<ConnectorInfo | null>(null);
   const [isConfigOpen, setIsConfigOpen] = React.useState(false);
   const [isSyncing, setIsSyncing] = React.useState<Record<string, boolean>>({});
   const [actionNotice, setActionNotice] = React.useState<string | null>(null);
+  const [actionError, setActionError] = React.useState<string | null>(null);
   const [modeToggleLoading, setModeToggleLoading] = React.useState(false);
 
-  // Configuration modal state
   const [configToken, setConfigToken] = React.useState("");
   const [configExtra, setConfigExtra] = React.useState("");
 
-  React.useEffect(() => {
-    loadData();
-  }, []);
+  const [watchPath, setWatchPath] = React.useState("./storage/docs");
+  const [datasetTitle, setDatasetTitle] = React.useState("");
+  const [datasetNote, setDatasetNote] = React.useState("");
+  const [datasets, setDatasets] = React.useState<ResourceItem[]>([]);
+  const [isSavingDataset, setIsSavingDataset] = React.useState(false);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
 
-  const loadData = async () => {
+  const loadData = React.useCallback(async () => {
     try {
-      const [modeRes, listRes] = await Promise.all([
+      const [modeRes, listRes, oauthRes] = await Promise.all([
         getSystemMode(),
-        listConnectors()
+        listConnectors(),
+        getOAuthStatus(),
       ]);
       setSystemModeState(modeRes);
       setConnectors(listRes.connectors);
+      setOauthStatus(oauthRes);
+      if (modeRes.air_gapped) {
+        const resources = await listIndexedResources();
+        setDatasets(resources);
+      }
     } catch (e) {
       console.error("Failed to load connectors data", e);
     }
-  };
+  }, []);
 
-  const handleModeToggle = async (checked: boolean) => {
+  React.useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  React.useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const oauth = params.get("oauth");
+    const provider = params.get("provider");
+    const detail = params.get("detail");
+    if (!oauth) return;
+    if (oauth === "success") {
+      setActionNotice(
+        `Connected ${provider === "google" ? "Gmail" : "GitHub"} with your account. You can sync now.`
+      );
+    } else {
+      setActionError(
+        `OAuth did not complete${provider ? ` for ${provider}` : ""}${detail ? `: ${detail}` : ""}.`
+      );
+    }
+    loadData();
+    params.delete("oauth");
+    params.delete("provider");
+    params.delete("detail");
+    const next = params.toString();
+    window.history.replaceState({}, "", `${window.location.pathname}${next ? `?${next}` : ""}`);
+  }, [loadData]);
+
+  const handleModeSelect = async (airGapped: boolean) => {
+    if (systemMode && systemMode.air_gapped === airGapped) return;
     setModeToggleLoading(true);
     try {
-      const newMode = await setSystemMode(checked);
+      const newMode = await setSystemMode(airGapped);
       setSystemModeState(newMode);
       setActionNotice(`System switched to ${newMode.mode_label}`);
+      setActionError(null);
       setTimeout(() => setActionNotice(null), 3000);
-      // Reload connectors to reflect any network guard changes
       const listRes = await listConnectors();
       setConnectors(listRes.connectors);
+      if (airGapped) {
+        setDatasets(await listIndexedResources());
+      }
     } catch (e) {
       console.error(e);
-      setActionNotice("Failed to toggle mode");
+      setActionError("Failed to toggle mode");
     } finally {
       setModeToggleLoading(false);
     }
@@ -99,15 +160,14 @@ export function Connectors() {
   const handleSync = async (connector: ConnectorInfo) => {
     setIsSyncing((prev) => ({ ...prev, [connector.name]: true }));
     setActionNotice(null);
+    setActionError(null);
     try {
       await triggerSync(connector.name);
       setActionNotice(`Sync started for ${connector.title}`);
       setTimeout(() => setActionNotice(null), 3000);
-      
-      // Poll for status update or rely on SSE if implemented. For now, reload after a bit.
       setTimeout(loadData, 2000);
     } catch (e) {
-      setActionNotice(`Sync failed for ${connector.title}`);
+      setActionError(`Sync failed for ${connector.title}`);
     } finally {
       setIsSyncing((prev) => ({ ...prev, [connector.name]: false }));
     }
@@ -120,39 +180,130 @@ export function Connectors() {
     setIsConfigOpen(true);
   };
 
+  const startOAuth = (provider: "github" | "google") => {
+    const configured = provider === "github" ? oauthStatus.github.configured : oauthStatus.google.configured;
+    if (!configured) {
+      setActionError(
+        provider === "github"
+          ? "GitHub OAuth is not configured. Set GITHUB_OAUTH_CLIENT_ID and GITHUB_OAUTH_CLIENT_SECRET, or paste a personal access token in Configure."
+          : "Gmail OAuth is not configured. Set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET."
+      );
+      return;
+    }
+    window.location.href = getOAuthStartUrl(provider);
+  };
+
   const handleSaveConfig = async () => {
     if (!selectedConnector) return;
     try {
-      await connectConnector(selectedConnector.name, configToken || undefined, {
-        extra: configExtra
-      });
+      const name = selectedConnector.name.toLowerCase();
+      const config: Record<string, unknown> = {};
+      if (configExtra) {
+        if (name.includes("github")) {
+          config.repositories = configExtra;
+        } else if (name.includes("gmail")) {
+          config.label_filter = configExtra;
+        } else if (name.includes("local")) {
+          config.watch_paths = configExtra;
+        } else {
+          config.extra = configExtra;
+        }
+      }
+      await connectConnector(selectedConnector.name, configToken || undefined, config);
       setActionNotice(`Connected ${selectedConnector.title} successfully.`);
+      setActionError(null);
       setIsConfigOpen(false);
-      loadData(); // Refresh statuses
+      loadData();
       setTimeout(() => setActionNotice(null), 3000);
     } catch (e) {
-      setActionNotice(`Failed to connect ${selectedConnector.title}.`);
+      setActionError(`Failed to connect ${selectedConnector.title}.`);
     }
   };
 
+  const handleConnectLocal = async () => {
+    const local = connectors.find((c) => c.name.toLowerCase().includes("local"));
+    if (!local) {
+      setActionError("Local filesystem connector is not registered.");
+      return;
+    }
+    try {
+      await connectConnector(local.name, undefined, { watch_paths: watchPath });
+      setActionNotice(`Local filesystem connected at ${watchPath}`);
+      setActionError(null);
+      loadData();
+    } catch (e) {
+      setActionError("Failed to connect local filesystem.");
+    }
+  };
+
+  const handleSaveDatasetFiles = async (files: FileList | null) => {
+    const fileList = files ? Array.from(files) : [];
+    const baseTitle = datasetTitle.trim();
+    const notes = datasetNote.trim();
+    if (fileList.length === 0 && !notes) {
+      setActionError("Pick local files or paste notes before saving a dataset.");
+      return;
+    }
+    setIsSavingDataset(true);
+    setActionError(null);
+    try {
+      for (const file of fileList) {
+        const name = file.name.replace(/\.[^/.]+$/, "").replace(/[-_]/g, " ");
+        const title = baseTitle
+          ? fileList.length === 1
+            ? baseTitle
+            : `${baseTitle}: ${name}`
+          : name.charAt(0).toUpperCase() + name.slice(1);
+        await uploadDocumentFile(file, {
+          title,
+          tenant_id: "corp-default",
+          allowed_users: ["alice"],
+        });
+      }
+      if (notes) {
+        await ingestDocument({
+          title: baseTitle || "Dataset notes",
+          content: notes,
+          tenant_id: "corp-default",
+          allowed_users: ["alice"],
+        });
+      }
+      setDatasetTitle("");
+      setDatasetNote("");
+      setDatasets(await listIndexedResources());
+      setActionNotice("Dataset saved.");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Dataset save failed";
+      setActionError(msg);
+    } finally {
+      setIsSavingDataset(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const handleDeleteDataset = async (id: string, title: string) => {
+    try {
+      await deleteDocument(id);
+      setDatasets((prev) => prev.filter((item) => item.id !== id));
+      setActionNotice(`Removed dataset "${title}"`);
+    } catch (e) {
+      setActionError("Failed to delete dataset.");
+    }
+  };
+
+  const airGapped = Boolean(systemMode?.air_gapped);
   const filtered = (connectors || []).filter((c) => {
     if (!c) return false;
+    if (!catalogMatch(c.name || "", airGapped)) return false;
     const title = c.title || c.name || "";
     const description = c.description || "";
-    const matchesSearch =
-      title.toLowerCase().includes((searchQuery || "").toLowerCase()) ||
-      description.toLowerCase().includes((searchQuery || "").toLowerCase());
-    const matchesStatus =
-      statusFilter === "all" || c.status === statusFilter;
-    return matchesSearch && matchesStatus;
+    const q = (searchQuery || "").toLowerCase();
+    return title.toLowerCase().includes(q) || description.toLowerCase().includes(q);
   });
 
   return (
     <div className="flex flex-col h-[calc(100vh-8rem)] p-4 max-w-7xl mx-auto w-full gap-4">
-      {/* Top Controls and Filters */}
       <div className="flex flex-col gap-4 rounded-xl border border-border/80 bg-card/60 p-4">
-        
-        {/* Header row with Mode Switch */}
         <div className="flex items-center justify-between border-b border-border/50 pb-4">
           <div>
             <h2 className="text-xl font-bold text-foreground flex items-center gap-2">
@@ -160,31 +311,40 @@ export function Connectors() {
               Sovereign Connector Marketplace
             </h2>
             <p className="text-sm text-muted-foreground mt-1">
-              Connect local and enterprise knowledge sources to your private AegisMind knowledge graph.
+              Connect local datasets in Sovereign mode, or GitHub and Gmail in Connected mode.
             </p>
           </div>
-          
-          {systemMode && (
-            <div className="flex items-center gap-3 bg-muted/50 p-2.5 rounded-lg border border-border">
-              <div className="flex flex-col items-end">
-                <span className="text-sm font-semibold flex items-center gap-1">
-                  {systemMode.air_gapped ? <Lock className="h-3.5 w-3.5 text-orange-500" /> : <Globe className="h-3.5 w-3.5 text-green-500" />}
-                  {systemMode.mode_label}
-                </span>
-                <span className="text-xs text-muted-foreground">
-                  External connectors {systemMode.external_connectors_enabled ? "enabled" : "disabled"}
-                </span>
-              </div>
-              <Switch 
-                checked={systemMode.air_gapped}
-                onCheckedChange={handleModeToggle}
-                disabled={modeToggleLoading}
-              />
-            </div>
-          )}
+
+          <div className="flex items-center gap-2 bg-muted/50 p-1.5 rounded-lg border border-border">
+            <button
+              type="button"
+              disabled={modeToggleLoading}
+              onClick={() => handleModeSelect(true)}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                airGapped
+                  ? "bg-background text-foreground shadow-sm border border-border"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <Lock className="h-3.5 w-3.5 text-orange-500" />
+              Sovereign
+            </button>
+            <button
+              type="button"
+              disabled={modeToggleLoading}
+              onClick={() => handleModeSelect(false)}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                !airGapped
+                  ? "bg-background text-foreground shadow-sm border border-border"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <Globe className="h-3.5 w-3.5 text-green-500" />
+              Connected
+            </button>
+          </div>
         </div>
 
-        {/* Search and Filters */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-2">
           <div className="relative w-full sm:w-72">
             <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
@@ -195,22 +355,11 @@ export function Connectors() {
               className="pl-9 h-9 text-xs bg-background/50"
             />
           </div>
-          <div className="flex gap-1 text-xs p-1 bg-muted/30 rounded-md border border-border/50">
-            {["all", "connected", "registered", "error"].map((st) => (
-              <button
-                key={st}
-                type="button"
-                onClick={() => setStatusFilter(st)}
-                className={`rounded px-3 py-1.5 capitalize transition-colors ${
-                  statusFilter === st
-                    ? "bg-background text-foreground font-medium shadow-sm border border-border/50"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                {st}
-              </button>
-            ))}
-          </div>
+          <p className="text-xs text-muted-foreground">
+            {airGapped
+              ? "Sovereign: local filesystem and personal datasets only."
+              : "Connected: sign in with your GitHub or Gmail account."}
+          </p>
         </div>
       </div>
 
@@ -220,21 +369,26 @@ export function Connectors() {
           <span>{actionNotice}</span>
         </div>
       )}
+      {actionError && (
+        <div className="rounded-lg bg-destructive/10 border border-destructive/30 p-3 text-xs text-destructive flex items-center gap-2">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span>{actionError}</span>
+        </div>
+      )}
 
-      {/* Grid of Connectors */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5 overflow-y-auto pr-1 pb-10">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5 overflow-y-auto pr-1 pb-4">
         {filtered.map((connector) => {
           const syncing = isSyncing[connector.name];
           const isConnected = connector.status === "connected";
-          const requiresNetwork = connector.spec?.network_required ?? false;
-          const isDisabled = systemMode?.air_gapped && requiresNetwork;
+          const name = connector.name.toLowerCase();
+          const isGithub = name.includes("github");
+          const isGmail = name.includes("gmail");
+          const isLocal = name.includes("local");
 
           return (
             <Card
               key={connector.name}
-              className={`flex flex-col justify-between border-border/70 transition-all ${
-                isDisabled ? "bg-muted/20 opacity-75" : "bg-card/40 hover:bg-card/70 hover:border-primary/30"
-              }`}
+              className="flex flex-col justify-between border-border/70 bg-card/40 hover:bg-card/70 hover:border-primary/30 transition-all"
             >
               <CardHeader className="p-4 pb-2">
                 <div className="flex items-start justify-between">
@@ -277,22 +431,57 @@ export function Connectors() {
                     {connector.lastSync ? new Date(connector.lastSync).toLocaleString() : "Never"}
                   </span>
                 </div>
-                {isDisabled && (
-                  <div className="text-[10px] text-orange-500 font-medium flex items-center gap-1 pt-1">
-                    <Lock className="w-3 h-3" /> Disabled in Sovereign Mode
-                  </div>
+                {isGithub && (
+                  <p className="text-[10px] text-muted-foreground">
+                    OAuth {oauthStatus.github.configured ? "ready" : "needs client ID in .env"}
+                  </p>
+                )}
+                {isGmail && (
+                  <p className="text-[10px] text-muted-foreground">
+                    OAuth {oauthStatus.google.configured ? "ready" : "needs client ID in .env"}
+                  </p>
                 )}
               </CardContent>
 
-              <CardFooter className="p-4 pt-2 border-t border-border/30 flex gap-2">
-                {!isConnected ? (
-                  <Button 
-                    className="w-full text-xs h-8 bg-primary/90 hover:bg-primary" 
-                    onClick={() => openConfig(connector)}
-                    disabled={isDisabled}
-                  >
-                    <Power className="mr-2 h-3 w-3" /> Connect
-                  </Button>
+              <CardFooter className="p-4 pt-2 border-t border-border/30 flex flex-col gap-2">
+                {isLocal ? (
+                  <>
+                    <Input
+                      value={watchPath}
+                      onChange={(e) => setWatchPath(e.target.value)}
+                      placeholder="Watch path on this PC"
+                      className="h-8 text-xs"
+                    />
+                    <div className="flex gap-2 w-full">
+                      <Button className="w-full text-xs h-8" onClick={handleConnectLocal}>
+                        <Power className="mr-2 h-3 w-3" /> Connect path
+                      </Button>
+                      <Button
+                        variant="default"
+                        className="w-full text-xs h-8"
+                        onClick={() => handleSync(connector)}
+                        disabled={syncing}
+                      >
+                        <RefreshCw className={`mr-2 h-3 w-3 ${syncing ? "animate-spin" : ""}`} />
+                        {syncing ? "Syncing..." : "Sync"}
+                      </Button>
+                    </div>
+                  </>
+                ) : !isConnected ? (
+                  <div className="flex gap-2 w-full">
+                    <Button
+                      className="w-full text-xs h-8 bg-primary/90 hover:bg-primary"
+                      onClick={() => startOAuth(isGmail ? "google" : "github")}
+                    >
+                      <Power className="mr-2 h-3 w-3" />
+                      {isGmail ? "Connect with Google" : "Connect with GitHub"}
+                    </Button>
+                    {isGithub && (
+                      <Button variant="outline" className="text-xs h-8" onClick={() => openConfig(connector)}>
+                        PAT
+                      </Button>
+                    )}
+                  </div>
                 ) : (
                   <>
                     <Button
@@ -306,10 +495,17 @@ export function Connectors() {
                       variant="default"
                       className="w-full text-xs h-8"
                       onClick={() => handleSync(connector)}
-                      disabled={syncing || isDisabled}
+                      disabled={syncing}
                     >
                       <RefreshCw className={`mr-2 h-3 w-3 ${syncing ? "animate-spin" : ""}`} />
                       {syncing ? "Syncing..." : "Sync"}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      className="w-full text-xs h-8"
+                      onClick={() => startOAuth(isGmail ? "google" : "github")}
+                    >
+                      Reconnect account
                     </Button>
                   </>
                 )}
@@ -319,12 +515,97 @@ export function Connectors() {
         })}
         {filtered.length === 0 && (
           <div className="col-span-full py-10 text-center text-muted-foreground">
-            <p>No connectors found.</p>
+            <p>
+              {airGapped
+                ? "No local filesystem connector is registered."
+                : "No GitHub or Gmail connector is registered."}
+            </p>
           </div>
         )}
       </div>
 
-      {/* Configuration Dialog */}
+      {airGapped && (
+        <Card className="border-border/80 bg-card/60">
+          <CardHeader className="p-4 pb-2">
+            <CardTitle className="text-sm flex items-center gap-2">
+              <Database className="h-4 w-4 text-primary" />
+              Prepare and save a local dataset
+            </CardTitle>
+            <CardDescription className="text-xs">
+              Pick files from this PC, give the dataset a name, and save it into the sovereign index.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="p-4 pt-2 space-y-3">
+            <Input
+              value={datasetTitle}
+              onChange={(e) => setDatasetTitle(e.target.value)}
+              placeholder="Dataset name"
+              className="h-8 text-xs"
+            />
+            <textarea
+              value={datasetNote}
+              onChange={(e) => setDatasetNote(e.target.value)}
+              placeholder="Optional notes or pasted records to include"
+              className="w-full min-h-[72px] rounded-md border border-input bg-background px-3 py-2 text-xs"
+            />
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => handleSaveDatasetFiles(e.target.files)}
+            />
+            <div className="flex flex-wrap gap-2">
+              <Button
+                className="text-xs h-8"
+                disabled={isSavingDataset}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                {isSavingDataset ? (
+                  <RefreshCw className="mr-2 h-3 w-3 animate-spin" />
+                ) : (
+                  <UploadCloud className="mr-2 h-3 w-3" />
+                )}
+                Pick files and save dataset
+              </Button>
+              <Button
+                variant="outline"
+                className="text-xs h-8"
+                disabled={isSavingDataset || (!datasetTitle.trim() && !datasetNote.trim())}
+                onClick={() => handleSaveDatasetFiles(null)}
+              >
+                Save notes as dataset
+              </Button>
+            </div>
+
+            <div className="space-y-2 max-h-48 overflow-y-auto">
+              {datasets.length === 0 ? (
+                <p className="text-xs text-muted-foreground">No saved datasets yet.</p>
+              ) : (
+                datasets.map((item) => (
+                  <div
+                    key={item.id}
+                    className="flex items-center justify-between rounded-md border border-border/60 px-3 py-2 text-xs"
+                  >
+                    <div>
+                      <p className="font-medium text-foreground">{item.title}</p>
+                      <p className="text-[10px] text-muted-foreground font-mono">{item.id}</p>
+                    </div>
+                    <Button
+                      variant="ghost"
+                      className="h-7 w-7 p-0 text-destructive"
+                      onClick={() => handleDeleteDataset(item.id, item.title)}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                ))
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       <Dialog open={isConfigOpen} onOpenChange={setIsConfigOpen}>
         <DialogContent className="sm:max-w-md bg-card border-border">
           <DialogHeader>
@@ -333,9 +614,9 @@ export function Connectors() {
               Connect {selectedConnector?.title}
             </DialogTitle>
             <DialogDescription className="text-xs">
-              {selectedConnector?.spec?.requires_auth 
-                ? "Enter your credentials to securely connect this knowledge source." 
-                : "Configure the settings for this connector."}
+              {selectedConnector?.name.toLowerCase().includes("github")
+                ? "Paste a GitHub personal access token with repo read access, or use Connect with GitHub."
+                : "Configure this connector."}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
@@ -345,33 +626,22 @@ export function Connectors() {
               </label>
               <Input
                 type="password"
-                placeholder="ghp_... or placeholder token"
+                placeholder="ghp_... (GitHub PAT fallback)"
                 value={configToken}
                 onChange={(e) => setConfigToken(e.target.value)}
                 className="text-xs font-mono"
               />
-              <p className="text-[10px] text-muted-foreground">
-                Tokens are stored in the secure backend vault and are never exposed to the LLM.
-              </p>
             </div>
-            
             <div className="space-y-2">
               <label className="text-xs font-medium text-foreground flex items-center gap-1.5">
                 <Settings className="h-3 w-3" /> Additional Configuration (Optional)
               </label>
               <Input
-                placeholder="e.g. repos=org/repo"
+                placeholder="owner/repo or INBOX,SENT"
                 value={configExtra}
                 onChange={(e) => setConfigExtra(e.target.value)}
                 className="text-xs"
               />
-            </div>
-
-            <div className="rounded-md bg-muted/40 p-3 text-xs flex gap-2 border border-border/50">
-              <Shield className="h-4 w-4 text-primary shrink-0" />
-              <span className="text-muted-foreground leading-relaxed">
-                <strong>READ-ONLY Access:</strong> This connector will only read data. AegisMind will never modify your source systems.
-              </span>
             </div>
           </div>
           <DialogFooter className="sm:justify-between border-t border-border/50 pt-4">

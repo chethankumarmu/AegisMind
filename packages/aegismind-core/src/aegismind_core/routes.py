@@ -6,11 +6,14 @@ import json
 import logging
 import os
 import re
+import secrets
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, cast
+from urllib.parse import quote
 
+from aegismind_connector_sdk.network_guard import NetworkEgressGuard, set_network_guard
 from aegismind_connector_sdk.ports import ConnectorPort, ConnectorSpec
 from aegismind_connector_sdk.registry import ConnectorRegistry
 from aegismind_graph.engine import KnowledgeGraphEngine
@@ -40,7 +43,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from aegismind_core.adapters.llm import get_llm_adapter
@@ -55,7 +58,15 @@ from aegismind_core.agent import (
 )
 from aegismind_core.approval import ApprovalGate
 from aegismind_core.budgeting import apply_context_budget
+from aegismind_core.connector_runtime import (
+    CONNECTOR_OAUTH_MAP,
+    GITHUB_OAUTH_SCOPES,
+    GOOGLE_OAUTH_SCOPES,
+    hydrate_connector,
+    store_secret as persist_connector_secret,
+)
 from aegismind_core.memory import ConversationMemory
+from aegismind_core.oauth import get_oauth_provider
 from aegismind_core.observability import trace_span
 from aegismind_core.ports.llm import LLMPort
 
@@ -388,6 +399,7 @@ class CoreState:
         self.activity_recorder = LocalToolActivityRecorder(
             storage_path="./storage/activity/tool_events.json"
         )
+        self.oauth_states: dict[str, str] = {}
 
     def record_audit(
         self,
@@ -931,6 +943,8 @@ def create_routes(state: CoreState) -> APIRouter:
                 detail="Scribe worker is not configured (no ingestion pipeline)",
             )
 
+        await hydrate_connector(connector, state.secret_store, connector_id)
+
         run_id = f"sync_{connector_id}_{uuid.uuid4().hex[:8]}"
         state.record_audit(
             event_type="connector",
@@ -1106,16 +1120,18 @@ def create_routes(state: CoreState) -> APIRouter:
         # Store the provided token in the secret store
         if req.token:
             secret_key = f"{connector_id}_token"
-            await state.secret_store.set(secret_key, req.token)
+            await persist_connector_secret(state.secret_store, secret_key, req.token)
 
-        # Persist any additional config entries as secrets
         for key, value in (req.config or {}).items():
-            await state.secret_store.set(f"{connector_id}_{key}", str(value))
+            await persist_connector_secret(state.secret_store, f"{connector_id}_{key}", str(value))
 
-        # Update registration status
-        reg = state.connector_registry.get_registration(connector_id)
-        if reg:
-            reg.status = "connected"
+        await hydrate_connector(conn, state.secret_store, connector_id, req.config)
+
+        state.connector_registry.update_status(
+            connector_id,
+            "connected",
+            credential_key=f"{connector_id}_token" if req.token else None,
+        )
 
         state.record_audit(
             event_type="connector",
@@ -1141,7 +1157,12 @@ def create_routes(state: CoreState) -> APIRouter:
     async def set_system_mode(req: SystemModeRequest) -> dict[str, Any]:
         """Toggle the system between sovereign (air-gapped) and connected modes."""
         os.environ["AIR_GAPPED"] = "true" if req.air_gapped else "false"
+        os.environ["SOVEREIGN_MODE"] = "true" if req.air_gapped else "false"
         air_gapped = req.air_gapped
+        set_network_guard(NetworkEgressGuard(air_gapped=air_gapped))
+        for conn in state.connectors.values():
+            if hasattr(conn, "_network_guard"):
+                conn._network_guard = NetworkEgressGuard(air_gapped=air_gapped)
         state.record_audit(
             event_type="system",
             principal_id="admin",
@@ -1153,6 +1174,131 @@ def create_routes(state: CoreState) -> APIRouter:
             "mode_label": "SOVEREIGN (AIR-GAPPED)" if air_gapped else "CONNECTED",
             "external_connectors_enabled": not air_gapped,
         }
+
+    def _oauth_redirect_base() -> str:
+        return os.environ.get("OAUTH_REDIRECT_BASE", "http://127.0.0.1:8000").rstrip("/")
+
+    def _lens_app_url() -> str:
+        return os.environ.get("LENS_APP_URL", "http://localhost:3000").rstrip("/")
+
+    def _oauth_credentials(provider: str) -> tuple[str, str] | None:
+        if provider == "github":
+            client_id = os.environ.get("GITHUB_OAUTH_CLIENT_ID", "").strip()
+            client_secret = os.environ.get("GITHUB_OAUTH_CLIENT_SECRET", "").strip()
+        elif provider == "google":
+            client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "").strip()
+            client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "").strip()
+        else:
+            return None
+        if not client_id or not client_secret:
+            return None
+        return client_id, client_secret
+
+    def _oauth_return_redirect(provider: str, status_value: str, detail: str = "") -> RedirectResponse:
+        params = f"oauth={status_value}&provider={provider}"
+        if detail:
+            params += f"&detail={quote(detail, safe='')}"
+        return RedirectResponse(url=f"{_lens_app_url()}/?{params}", status_code=status.HTTP_302_FOUND)
+
+    @router.get("/oauth/status")
+    async def oauth_status() -> dict[str, Any]:
+        """Report whether GitHub and Google OAuth client credentials are configured."""
+        return {
+            "github": {"configured": _oauth_credentials("github") is not None},
+            "google": {"configured": _oauth_credentials("google") is not None},
+        }
+
+    @router.get("/oauth/{provider}/start")
+    async def oauth_start(provider: str) -> RedirectResponse:
+        """Redirect the user to GitHub or Google to authorize read-only access."""
+        normalized = provider.strip().lower()
+        if normalized not in CONNECTOR_OAUTH_MAP:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Unsupported OAuth provider",
+            )
+        air_gapped = os.environ.get("AIR_GAPPED", "false").lower() in ("1", "true", "yes")
+        if air_gapped:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="External OAuth is disabled in Sovereign mode",
+            )
+        creds = _oauth_credentials(normalized)
+        if creds is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    f"{normalized} OAuth is not configured. Set client ID and secret "
+                    "environment variables, then retry."
+                ),
+            )
+        client_id, client_secret = creds
+        scope = GITHUB_OAUTH_SCOPES if normalized == "github" else GOOGLE_OAUTH_SCOPES
+        oauth_provider = get_oauth_provider(normalized, client_id, client_secret, default_scope=scope)
+        csrf_state = secrets.token_urlsafe(24)
+        state.oauth_states[csrf_state] = normalized
+        redirect_uri = f"{_oauth_redirect_base()}/api/v1/oauth/{normalized}/callback"
+        extra = None
+        if normalized == "google":
+            extra = {"access_type": "offline", "prompt": "consent", "include_granted_scopes": "true"}
+        authorize_url = oauth_provider.get_authorization_url(
+            redirect_uri=redirect_uri,
+            state=csrf_state,
+            extra_params=extra,
+        )
+        return RedirectResponse(url=authorize_url, status_code=status.HTTP_302_FOUND)
+
+    @router.get("/oauth/{provider}/callback")
+    async def oauth_callback(
+        provider: str,
+        code: str | None = None,
+        state_token: str | None = Query(default=None, alias="state"),
+        error: str | None = None,
+    ) -> RedirectResponse:
+        """Exchange an OAuth code, store tokens, and activate the connector."""
+        normalized = provider.strip().lower()
+        connector_id = CONNECTOR_OAUTH_MAP.get(normalized)
+        if connector_id is None:
+            return _oauth_return_redirect(normalized, "error", "unsupported")
+        if error:
+            return _oauth_return_redirect(normalized, "error", error)
+        if not code or not state_token or state.oauth_states.pop(state_token, None) != normalized:
+            return _oauth_return_redirect(normalized, "error", "invalid_state")
+        creds = _oauth_credentials(normalized)
+        if creds is None:
+            return _oauth_return_redirect(normalized, "error", "not_configured")
+        client_id, client_secret = creds
+        scope = GITHUB_OAUTH_SCOPES if normalized == "github" else GOOGLE_OAUTH_SCOPES
+        oauth_provider = get_oauth_provider(normalized, client_id, client_secret, default_scope=scope)
+        redirect_uri = f"{_oauth_redirect_base()}/api/v1/oauth/{normalized}/callback"
+        try:
+            token = await oauth_provider.exchange_code(code=code, redirect_uri=redirect_uri)
+        except Exception as exc:
+            logger.warning("OAuth code exchange failed for %s: %s", normalized, exc)
+            return _oauth_return_redirect(normalized, "error", "exchange_failed")
+
+        await persist_connector_secret(state.secret_store, f"{connector_id}_token", token.access_token)
+        if token.refresh_token:
+            await persist_connector_secret(
+                state.secret_store, f"{connector_id}_refresh_token", token.refresh_token
+            )
+
+        conn = state.connectors.get(connector_id)
+        if conn is not None:
+            await hydrate_connector(conn, state.secret_store, connector_id)
+            state.connector_registry.update_status(
+                connector_id,
+                "connected",
+                credential_key=f"{connector_id}_token",
+            )
+        state.record_audit(
+            event_type="connector",
+            principal_id="system",
+            action="OAUTH_CONNECTED",
+            resource_id=connector_id,
+            metadata={"provider": normalized},
+        )
+        return _oauth_return_redirect(normalized, "success")
 
     # 5. GET|POST /api/v1/group-aliases: Manage identity group mappings
     @router.get("/group-aliases")

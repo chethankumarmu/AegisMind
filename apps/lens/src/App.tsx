@@ -162,6 +162,13 @@ export function App() {
   });
 
   React.useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("oauth")) {
+      setActiveTab("connectors");
+    }
+  }, []);
+
+  React.useEffect(() => {
     const root = document.documentElement;
     if (isDarkMode) {
       root.classList.add("dark");
@@ -452,7 +459,9 @@ export function App() {
         {activeTab === "search" && (
           <Search currentTenantId={currentTenantId} currentUserId={currentUserId} />
         )}
-        {activeTab === "connectors" && <Connectors />}
+        <div className={activeTab === "connectors" ? "flex-1 flex flex-col" : "hidden"}>
+          <Connectors />
+        </div>
         {activeTab === "access" && (
           <Access currentTenantId={currentTenantId} currentUserId={currentUserId} />
         )}

@@ -249,6 +249,21 @@ class GmailConnector(ConnectorPort):
         """
         self._access_token = access_token
 
+    def apply_runtime_config(self, config: dict[str, Any]) -> None:
+        """Apply Gmail label filter and max message settings."""
+        if "label_filter" in config:
+            labels = config.get("label_filter")
+            if isinstance(labels, str):
+                cleaned = labels.replace("label_filter=", "")
+                self._label_filter = [part.strip() for part in cleaned.split(",") if part.strip()]
+            elif isinstance(labels, list):
+                self._label_filter = [str(item).strip() for item in labels if str(item).strip()]
+            if self._label_filter:
+                self.config["label_filter"] = self._label_filter
+        if "max_messages" in config:
+            self._max_messages = int(config["max_messages"])
+            self.config["max_messages"] = self._max_messages
+
     def _headers(self) -> dict[str, str]:
         """Build Gmail API auth headers (token not exposed to callers)."""
         headers = {"Accept": "application/json"}

@@ -262,6 +262,20 @@ class GitHubConnector(ConnectorPort):
         """
         self._access_token = access_token
 
+    def apply_runtime_config(self, config: dict[str, Any]) -> None:
+        """Apply repositories and branch settings from a connect payload."""
+        if "repositories" in config:
+            repos = config.get("repositories")
+            if isinstance(repos, str):
+                cleaned = repos.replace("repos=", "")
+                self._selected_repos = [part.strip() for part in cleaned.split(",") if part.strip()]
+            elif isinstance(repos, list):
+                self._selected_repos = [str(item).strip() for item in repos if str(item).strip()]
+            self.config["repositories"] = self._selected_repos
+        if "default_branch" in config and config["default_branch"]:
+            self._branch = str(config["default_branch"])
+            self.config["default_branch"] = self._branch
+
     async def check(self) -> bool:
         """Verify connectivity and token validity by calling /user."""
         self._network_guard.assert_network_allowed(CONNECTOR_TYPE)
@@ -424,7 +438,14 @@ class GitHubConnector(ConnectorPort):
         previous_hashes: dict[str, str] = dict(sync_state.content_hashes)
         seen_external_ids: set[str] = set()
 
-        repos_to_index = self._selected_repos
+        repos_to_index = list(self._selected_repos)
+        if not repos_to_index:
+            sources = await self.list_sources()
+            repos_to_index = [source.source_id for source in sources[:20]]
+            logger.info(
+                "GitHub connector: no repositories configured, defaulting to %d accessible repos",
+                len(repos_to_index),
+            )
         if not repos_to_index:
             logger.warning("GitHub connector: no repositories selected; nothing to index")
             return

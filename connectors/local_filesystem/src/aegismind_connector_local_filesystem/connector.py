@@ -166,6 +166,23 @@ class LocalFilesystemConnector(ConnectorPort):
         )
         self._watcher: Any = None
 
+    def apply_runtime_config(self, config: dict[str, Any]) -> None:
+        """Update watch paths used for sovereign local indexing."""
+        if "watch_paths" not in config:
+            return
+        raw = config.get("watch_paths")
+        paths: list[str]
+        if isinstance(raw, str):
+            paths = [part.strip() for part in raw.split(",") if part.strip()]
+        elif isinstance(raw, list):
+            paths = [str(item).strip() for item in raw if str(item).strip()]
+        else:
+            paths = []
+        if not paths:
+            return
+        self.watch_paths = [Path(p).resolve() for p in paths]
+        self.config["watch_paths"] = [str(p) for p in self.watch_paths]
+
     def spec(self) -> ConnectorSpec:
         return ConnectorSpec(
             name=self.CONNECTOR_TYPE,
